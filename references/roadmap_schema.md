@@ -50,6 +50,7 @@
 | started_at | string | 否 | 开始执行时间 |
 | completed_at | string | 否 | 完成/跳过时间 |
 | attempts | int | 否 | 尝试次数（step 时自动 +1） |
+| forced | bool | 否 | v2.1 新增；true 时忽略 `condition` 强制重跑（由 `reset --id N --force` 设置，`complete` 后自动清零） |
 
 ---
 
@@ -120,6 +121,24 @@
 - 同组的子任务必须拥有相同的 `parallel_group` 字符串。
 - 调度器只有在整组所有**尚未完成**的成员都满足依赖时，才会把这组任务一起返回。
 - 是否真并行执行由调用 Agent 决定；本技能只负责"一起放出"。
+
+---
+
+## 强制重跑被跳过的任务（v2.1）
+
+带 `condition` 的任务一旦被判定为 `skipped`，普通 `reset` 只能把它退回 `pending`，但下次 `step` 时条件仍为假会**再次跳过**——这就是"跳过后的任务回不来"的根因。
+
+解决：用 `reset --id N --force`。它会把该任务标记为 `forced=true`，`step` 时忽略 `condition` 直接派发；`complete` 后 `forced` 自动清零。
+
+> 对照（Before → After）：`reset --id 8` → 仍 `skipped`；`reset --id 8 --force` → 可重新 `step` 并执行。
+
+---
+
+## 兜底保障与步数限制（v2.1，硬代码）
+
+- **依赖失败级联失败**：若某任务的硬依赖状态为 `failed`，该任务会被自动标记为 `failed`（并写入 trace），避免下游永久 `pending` 导致死锁，保证严格闭环。可用 `reset` 恢复。
+- **重试上限 `MAX_ATTEMPTS=5`**：单任务 `attempts` 达到上限后不再派发，需 `reset --id N` 清零后重试，防死循环。
+- **规模上限 `MAX_SUBTASKS=1000`**：`validate` 拒绝超过此数量的 `subtasks`。
 
 ---
 
