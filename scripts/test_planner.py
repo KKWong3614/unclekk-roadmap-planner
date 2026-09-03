@@ -233,6 +233,48 @@ def test_failed_reset_recovery():
     print("✓ failed_reset_recovery")
 
 
+def test_skip_force_recovery():
+    """被 condition 跳过的任务，用 reset --force 可强制重跑（修复 R 项短板）"""
+    path = new_tmp("skiprecover")
+    data = {
+        "schema": "2.0",
+        "goal": "测试跳过任务强制恢复",
+        "mode": "complex",
+        "subtasks": [
+            {"subtask_id": 1, "subtask_description": "A", "exact_input": "", "expected_output": "", "depends_on": []},
+            {"subtask_id": 2, "subtask_description": "B", "exact_input": "", "expected_output": "", "depends_on": [1],
+             "condition": 'len(outputs.get(1, "")) > 5'},
+            {"subtask_id": 3, "subtask_description": "C", "exact_input": "", "expected_output": "", "depends_on": [2]},
+        ]
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    run("step", path)
+    run("complete", path, "--id", "1", "--output", "hi")  # 短产出，条件为假
+    out, err, rc = run("step", path)          # #2 跳过，#3 被派发(running)
+    assert rc == 0 and "READY #3" in out, out + err
+    run("complete", path, "--id", "3", "--output", "C 先完成")  # 先收尾下游，避免卡在 running
+    d = load(path)
+    assert d["subtasks"][1]["status"] == "skipped"
+
+    # 不用 force：reset 后再次 step，#2 仍会被条件跳过
+    run("reset", path, "--id", "2")
+    out, err, rc = run("step", path)
+    assert rc == 0, out + err
+    d = load(path)
+    assert d["subtasks"][1]["status"] == "skipped", "未用 --force 时 #2 应保持跳过"
+
+    # 用 force：reset --force 后 #2 可强制重跑
+    run("reset", path, "--id", "2", "--force")
+    out, err, rc = run("step", path)
+    assert rc == 0 and "READY #2" in out, out + err + "（--force 应让 #2 可重跑）"
+    run("complete", path, "--id", "2", "--output", "B 产出（强制重跑）")
+    out, err, rc = run("step", path)
+    assert rc == 0 and "ALL DONE" in out, out + err
+    print("✓ skip_force_recovery")
+
+
 def main():
     tests = [
         test_simple_mode,
@@ -242,6 +284,7 @@ def main():
         test_complete_order_guard,
         test_worker_assign,
         test_failed_reset_recovery,
+        test_skip_force_recovery,
     ]
     for t in tests:
         try:
