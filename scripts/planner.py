@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-unclekk-roadmap-planner v2.0
+unclekk-roadmap-planner v2.1
 ===========================
 依据 AgentScope 1.0 论文 Meta Planner 模块的忠实实现：
 
@@ -10,7 +10,9 @@ unclekk-roadmap-planner v2.0
 - WorkerManager：worker 分配(assigned_worker) + 工具组合分配(desired_auxiliary_tools)
 - 调度器：DAG 拓扑排序、并行组(parallel_group)、条件跳过(condition)、上下文按依赖聚合
 - 持久状态：JSON 落盘 + 原子写 + 时间戳/尝试次数/trace
-- 可恢复：reset 子任务，支持调试与任务续跑
+- 可恢复：reset 子任务（含 --force 强制重跑被条件跳过的任务），支持调试与任务续跑
+- 硬代码兜底（v2.1 新增）：MAX_ATTEMPTS 防死循环、MAX_SUBTASKS 防超大文件、
+  依赖失败级联失败保证严格闭环、路径遍历拒绝、condition 沙箱求值
 
 本技能是编排器，不直接调用 LLM。真正的 Worker 执行由调用 Agent 完成。
 """
@@ -26,12 +28,18 @@ from datetime import datetime, timezone
 SCHEMA_VERSION = "2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# ── 硬代码兜底保障（Hard-coded safeguards，v2.1 新增/强化）──────────
+MAX_ATTEMPTS = 5      # 单任务最大重试次数；超过需 reset 才能再跑，防止死循环
+MAX_SUBTASKS = 1000   # 单 roadmap 子任务数上限，防止异常超大文件拖垮调度
+_TRACE_MAX = 500      # trace 事件数上限，防止 JSON 文件无限增长
+
 # 论文未指定字段名，下列字段是把论文概念落地后的 JSON 设计：
 # - subtask_description / exact_input / expected_output / success_criteria
 #   对应论文 "executable subtasks with defined dependencies and success criteria"
 # - desired_auxiliary_tools 对应论文 "specialized toolkit allocation"
 # - depends_on 对应论文 "defined dependencies"
 # - assigned_worker 对应论文 "dynamic worker agent instantiation"
+# - forced (v2.1) 用于绕过 condition，强制重跑被条件跳过的任务
 
 
 class PlannerError(Exception):
@@ -43,9 +51,6 @@ def eprint(*a):
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
-
-# ── 路径安全 ──────────────────────────────────────────────
-_TRACE_MAX = 500  # trace 事件数上限，防止 JSON 文件无限增长
 
 
 def _trim_trace(trace: list) -> None:
@@ -112,6 +117,7 @@ def normalize_subtask(s, index):
         "started_at": None,
         "completed_at": None,
         "attempts": 0,
+        "forced": False,
     }
     for k, v in defaults.items():
         s.setdefault(k, v)
@@ -142,7 +148,7 @@ def normalize(data):
 
 def validate(data):
     """
-    校验 roadmap：字段、依赖、DAG 无环、parallel_group 一致性、mode 约束。
+    校验 roadmap：字段、依赖、DAG 无环、parallel_group 一致性、mode 约束、规模上限。
     返回错误列表（空表示通过）。
     """
     errors = []
@@ -155,6 +161,9 @@ def validate(data):
     if not isinstance(subs, list) or len(subs) == 0:
         errors.append("subtasks 必须是非空数组")
         return errors
+
+    if len(subs) > MAX_SUBTASKS:
+        errors.append(f"subtasks 数量({len(subs)})超过上限 {MAX_SUBTASKS}")
 
     mode = data.get("mode", "complex")
     if mode not in ("simple", "complex"):
@@ -304,60 +313,73 @@ def ready_subtasks(data):
     """
     返回当前可执行的子任务列表（已按 DAG 展开、条件求值、并行组聚合）。
     规则：
-    1. status 为 pending 或 running（允许重试）
-    2. 所有 depends_on 已完成(done) 或被跳过(skipped)
-    3. condition 表达式为真
-    4. 同一 parallel_group 的任务一起返回；若组内任一成员依赖未就绪，则整组不返回
+    1. 仅 status=pending（含被条件恢复 / forced 的）进入候选，running 不重复派发
+    2. 依赖全部完成(done)或被跳过(skipped)才可执行；依赖中有 failed → 级联标记 failed（兜底闭环）
+    3. condition 表达式为假 → skipped；forced=True 可绕过 condition
+    4. 同一 parallel_group 的任务一起返回
+    返回 (ready_items, newly_skipped, newly_failed)
     """
     subs = data["subtasks"]
-
-    # done 与 skipped 都视为依赖已满足；skipped_ids 会在本函数内动态追加
     finished_ids = {s["subtask_id"] for s in subs if s.get("status") in ("done", "skipped")}
+    failed_ids = {s["subtask_id"] for s in subs if s.get("status") == "failed"}
 
-    # 先计算每个任务的依赖是否全部完成
     def deps_satisfied(s):
-        deps = s.get("depends_on", []) or []
-        return all(d in finished_ids for d in deps)
+        return all(d in finished_ids for d in (s.get("depends_on", []) or []))
 
-    # 计算 outputs 用于 condition 求值
     outputs, _ = gather_outputs(data)
     goal = data.get("goal", "")
     context = data.get("context", {})
 
-    candidates = []
-    newly_skipped = []  # 本次调用新标记为 skipped 的子任务（用于落盘与提示）
+    candidates = []        # ("ready", s)
+    newly_skipped = []     # 本次新标记为 skipped 的子任务
+    newly_failed = []      # 本次级联失败：(s, failed_dep_ids)
+
     for s in subs:
         status = s.get("status")
-        # skipped 态也会重新求值 condition；若条件后来变为真则恢复为 pending（避免永久丢失）
+
+        # 被跳过的任务：带 condition 且条件后来变真 → 恢复为 pending 重新执行
         if status == "skipped":
             cond = s.get("condition")
             if cond:
                 try:
                     if safe_eval_condition(cond, outputs, goal, context):
                         s["status"] = "pending"
-                        del s["completed_at"]
-                        finished_ids.discard(s["subtask_id"])  # 不再视为依赖已满足
+                        s.pop("completed_at", None)
+                        finished_ids.discard(s["subtask_id"])
                         candidates.append(("ready", s))
-                    else:
-                        candidates.append(("skip", s))
+                        continue
                 except PlannerError:
                     raise
-            else:
-                candidates.append(("skip", s))
+            # 仍 skipped：保持，不派发
             continue
-        if status not in ("pending", "running"):
+
+        # running / failed 不进入候选（running 由 cmd_step 报告 WAITING）
+        if status in ("running", "failed"):
             continue
+        if status != "pending":
+            continue
+
+        deps = s.get("depends_on", []) or []
+        # 兜底：硬依赖失败 → 级联失败，避免死锁，保证严格闭环
+        failed_deps = [d for d in deps if d in failed_ids]
+        if failed_deps:
+            s["status"] = "failed"
+            s["completed_at"] = now_iso()
+            newly_failed.append((s, failed_deps))
+            continue
+
         if not deps_satisfied(s):
             continue
+
         cond = s.get("condition")
+        forced = s.get("forced", False)
         try:
-            if cond and not safe_eval_condition(cond, outputs, goal, context):
-                # 条件不满足 -> 标记为 skipped（幂等），并视为依赖已满足供下游使用
+            if cond and not forced and not safe_eval_condition(cond, outputs, goal, context):
+                # 条件不满足 → 标记为 skipped（幂等），并视为依赖已满足供下游使用
                 s["status"] = "skipped"
                 s["completed_at"] = now_iso()
                 finished_ids.add(s["subtask_id"])
                 newly_skipped.append(s)
-                candidates.append(("skip", s))
                 continue
         except PlannerError:
             raise
@@ -369,8 +391,6 @@ def ready_subtasks(data):
     group_members = defaultdict(list)
     ready_items = []
     for kind, s in candidates:
-        if kind == "skip":
-            continue
         pg = s.get("parallel_group")
         if pg:
             group_members[pg].append(s)
@@ -392,9 +412,7 @@ def ready_subtasks(data):
         if s["subtask_id"] not in seen:
             result.append(s)
             seen.add(s["subtask_id"])
-    return result, newly_skipped
-
-
+    return result, newly_skipped, newly_failed
 
 
 def cmd_new(args):
@@ -419,6 +437,7 @@ def cmd_new(args):
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             }
         ],
         "trace": [],
@@ -453,43 +472,54 @@ def cmd_step(args):
             eprint("  - " + e)
         sys.exit(1)
 
-    ready, newly_skipped = ready_subtasks(data)
-    if newly_skipped and ready:
-        # 存在可执行的 ready 任务时，也把本次被条件跳过的子任务打印出来，保证可见
+    ready, newly_skipped, newly_failed = ready_subtasks(data)
+
+    # 持久化本轮的状态转移（skip / 级联失败），保证可追溯
+    if newly_skipped or newly_failed:
+        trace = data.setdefault("trace", [])
+        _trim_trace(trace)
+        for s in newly_skipped:
+            trace.append({"event": "skip", "subtask_id": s["subtask_id"], "reason": "condition_unsatisfied", "at": now_iso()})
+        for s, deps in newly_failed:
+            trace.append({"event": "fail", "subtask_id": s["subtask_id"], "reason": "dep_failed:" + str(deps), "at": now_iso()})
+        data["updated_at"] = now_iso()
+        save(args.roadmap, data)
         for s in newly_skipped:
             print(f"SKIPPED #{s['subtask_id']} {s['subtask_description']}（条件不满足，已跳过）")
+        for s, deps in newly_failed:
+            print(f"FAILED #{s['subtask_id']} {s['subtask_description']}（依赖 {deps} 失败，已级联标记失败 → 需 reset 恢复）")
+
     if not ready:
-        # 有子任务因条件不满足被跳过：先落盘，保证 skipped 状态持久化、trace 可追溯
-        if newly_skipped:
-            trace = data.setdefault("trace", [])
-            _trim_trace(trace)
-            for s in newly_skipped:
-                trace.append({
-                    "event": "skip",
-                    "subtask_id": s["subtask_id"],
-                    "reason": "condition_unsatisfied",
-                    "at": now_iso(),
-                })
-            data["updated_at"] = now_iso()
-            save(args.roadmap, data)
-            for s in newly_skipped:
-                print(f"SKIPPED #{s['subtask_id']} {s['subtask_description']}（条件不满足，已跳过并持久化）")
-        # 检查是否全部完成/跳过
-        pending = [s for s in data["subtasks"] if s.get("status") == "pending"]
         running = [s for s in data["subtasks"] if s.get("status") == "running"]
-        if pending and not running:
-            eprint("当前没有可执行的子任务：部分 pending 子任务的依赖尚未完成或条件未满足。")
-            sys.exit(1)
         if running:
-            print("WAITING：以下子任务正在执行中，等待它们 complete:")
+            print("WAITING：以下子任务正在执行中，等待 complete:")
             for s in running:
                 print(f"  #{s['subtask_id']} {s['subtask_description']} (worker={s.get('assigned_worker') or '未分配'})")
             return
+        pending = [s for s in data["subtasks"] if s.get("status") == "pending"]
+        if pending:
+            eprint("当前没有可执行的子任务：部分 pending 子任务的依赖尚未完成，或条件不满足。可 `reset --id N --force` 强制重跑被跳过的任务。")
+            sys.exit(1)
         print("ALL DONE ✓")
         return
 
-    # 标记为 running
+    # 派发前兜底盘查：超过重试上限的任务不派发，需 reset 后才能再跑
+    dispatchable = []
     for s in ready:
+        if s.get("attempts", 0) >= MAX_ATTEMPTS:
+            eprint(f"⚠ 任务 #{s['subtask_id']} 已达重试上限({MAX_ATTEMPTS})，未派发；请 `reset --id {s['subtask_id']}` 后重试。")
+            continue
+        dispatchable.append(s)
+    if not dispatchable:
+        running = [s for s in data["subtasks"] if s.get("status") == "running"]
+        if running:
+            print("WAITING：有任务正在执行中，等待 complete。")
+            return
+        eprint("没有可派发的子任务（部分已达重试上限，需 reset）。")
+        sys.exit(1)
+
+    # 标记为 running 并派发
+    for s in dispatchable:
         s["status"] = "running"
         s["started_at"] = now_iso()
         s["attempts"] = s.get("attempts", 0) + 1
@@ -501,7 +531,7 @@ def cmd_step(args):
     # 记录 ready 事件到 trace，保证调度步骤可追溯
     trace = data.setdefault("trace", [])
     _trim_trace(trace)
-    for s in ready:
+    for s in dispatchable:
         trace.append({
             "event": "step",
             "subtask_id": s["subtask_id"],
@@ -511,14 +541,14 @@ def cmd_step(args):
     save(args.roadmap, data)
 
     # 输出 READY 信息
-    if len(ready) == 1:
-        print(f"READY #{ready[0]['subtask_id']}: {ready[0]['subtask_description']}")
+    if len(dispatchable) == 1:
+        print(f"READY #{dispatchable[0]['subtask_id']}: {dispatchable[0]['subtask_description']}")
     else:
-        ids = ",".join(str(s["subtask_id"]) for s in ready)
-        descs = " / ".join(s["subtask_description"] for s in ready)
+        ids = ",".join(str(s["subtask_id"]) for s in dispatchable)
+        descs = " / ".join(s["subtask_description"] for s in dispatchable)
         print(f"READY [{ids}]: {descs}")
 
-    for s in ready:
+    for s in dispatchable:
         outputs, ctx = gather_outputs(data, dep_ids=s.get("depends_on", []))
         print(f"\n--- subtask #{s['subtask_id']} ---")
         print(f"描述: {s['subtask_description']}")
@@ -532,7 +562,8 @@ def cmd_step(args):
         if s.get("parallel_group"):
             print(f"并行组: {s['parallel_group']}")
         if s.get("condition"):
-            print(f"执行条件: {s['condition']}")
+            tag = "（已强制重跑，忽略条件）" if s.get("forced") else ""
+            print(f"执行条件: {s['condition']}{tag}")
         if ctx:
             print("\n前置上下文（来自依赖项产出）:")
             print(ctx)
@@ -569,6 +600,7 @@ def cmd_complete(args):
     target["status"] = args.status
     target["output"] = args.output if args.output is not None else ""
     target["completed_at"] = now_iso()
+    target["forced"] = False  # 完成后清除强制标记
 
     # 记录 trace（限制最大事件数，防止 JSON 文件无限增长）
     trace = data.setdefault("trace", [])
@@ -588,7 +620,7 @@ def cmd_complete(args):
     elif args.status == "skipped":
         eprint(f"子任务 #{args.id} 已标记为跳过。")
     elif args.status == "failed":
-        eprint(f"子任务 #{args.id} 执行失败（可 reset 后重试）。")
+        eprint(f"子任务 #{args.id} 执行失败（下游将级联失败；可 reset 后重试）。")
     else:
         eprint(f"子任务 #{args.id} 状态更新为 {args.status}。")
 
@@ -674,8 +706,9 @@ def cmd_reset(args):
             s["started_at"] = None
             s["completed_at"] = None
             s["attempts"] = 0
+            s["forced"] = False
         data["trace"] = []
-        eprint("所有子任务已重置为 pending。")
+        eprint("所有子任务已重置为 pending（forced 已清除）。")
     else:
         target = next((s for s in data["subtasks"] if s["subtask_id"] == args.id), None)
         if target is None:
@@ -686,7 +719,11 @@ def cmd_reset(args):
         target["started_at"] = None
         target["completed_at"] = None
         target["attempts"] = 0
-        eprint(f"子任务 #{args.id} 已重置为 pending。")
+        target["forced"] = bool(args.force)
+        if args.force:
+            eprint(f"子任务 #{args.id} 已重置为 pending，并标记 forced（将忽略 condition 强制重跑）。")
+        else:
+            eprint(f"子任务 #{args.id} 已重置为 pending。")
     data["updated_at"] = now_iso()
     save(args.roadmap, data)
 
@@ -714,6 +751,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
             {
                 "subtask_id": 2,
@@ -728,6 +766,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
             {
                 "subtask_id": 3,
@@ -742,6 +781,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
             {
                 "subtask_id": 4,
@@ -756,6 +796,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
             {
                 "subtask_id": 5,
@@ -770,6 +811,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
             {
                 "subtask_id": 6,
@@ -784,6 +826,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
             {
                 "subtask_id": 7,
@@ -798,6 +841,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
             {
                 "subtask_id": 8,
@@ -812,6 +856,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
             {
                 "subtask_id": 9,
@@ -826,6 +871,7 @@ def demo_roadmap():
                 "assigned_worker": None,
                 "status": "pending",
                 "output": "",
+                "forced": False,
             },
         ],
         "trace": [],
@@ -852,7 +898,7 @@ def cmd_demo(args):
 
 def main():
     p = argparse.ArgumentParser(
-        description="unclekk-roadmap-planner v2.0: AgentScope 1.0 Meta Planner 风格的任务分解与编排器"
+        description="unclekk-roadmap-planner v2.1: AgentScope 1.0 Meta Planner 风格的任务分解与编排器"
     )
     sub = p.add_subparsers(dest="cmd")
 
@@ -895,6 +941,8 @@ def main():
     sp = sub.add_parser("reset", help="重置子任务状态（支持任务恢复/调试）")
     sp.add_argument("roadmap")
     sp.add_argument("--id", type=int, help="只重置指定子任务；省略则重置全部")
+    sp.add_argument("--force", action="store_true",
+                    help="强制重跑：忽略 condition 并把任务标记为可重新执行（用于恢复被条件跳过的任务）")
     sp.set_defaults(func=cmd_reset)
 
     sp = sub.add_parser("demo", help="生成竞品报告示例 roadmap（默认写到当前目录）")
