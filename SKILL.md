@@ -2,7 +2,7 @@
 slug: unclekk-roadmap-planner
 name: unclekk-roadmap-planner
 displayName: UncleKK Roadmap Planner
-version: 2.1.0
+version: 2.1.1
 summary: 依据 AgentScope 1.0 Meta Planner 的"先规划、再执行"编排器。DAG 依赖调度、并行组、条件跳过、Worker 分配、可审计可恢复。纯本地、零依赖、硬代码兜底。
 description: |
   依据 AgentScope 1.0 论文 Meta Planner 模块设计的"先规划、再执行"编排器（轻量、可运行、零第三方依赖）。
@@ -20,11 +20,12 @@ description: |
   关键词：Meta Planner、Roadmap、任务分解、DAG、并行组、条件跳过、WorkerManager、工具分配、先规划后执行、可审计、可恢复。
 license: MIT
 metadata:
-  version: 2.1.0
+  version: 2.1.1
   source_paper: "AgentScope 1.0: A Developer-Centric Framework for Building Agentic Applications (arXiv:2508.16279v1), Alibaba Group"
   agent_created: true
   category: productivity
   changelog:
+    - "2.1.1: 补齐 README.md / CHANGELOG.md / README.github.md（中文优先·skillhub版 / 英文优先·GitHub版），消除孤立文档、确保无断链；版本号三处一致。"
     - "2.1.0: 新增 reset --force 强制重跑被 condition 跳过的任务（修复 R 项'跳过无法重跑'）；running 不再被重复派发（修 attempts 无限膨胀）；依赖失败级联失败保证严格闭环；新增 MAX_ATTEMPTS/MAX_SUBTASKS 硬代码兜底。"
     - "2.0.0: 双模式、DAG 调度、并行组、条件跳过、Worker 分配、原子写、可恢复。"
 ---
@@ -240,8 +241,11 @@ grep -rnE "rm -rf|rm -fr|format |dd if=|curl .*\| ?bash|wget .*\| ?bash" \
 
 ---
 
-## 8. 更新日志 (Changelog)
+## 8. 更新日志 (Changelog) · 完整版见 CHANGELOG.md
 
+- **2.1.1**（2026-09-03）· 补齐文档
+  - 新增 `README.md`（中文优先·skillhub 版，小白友好）、`README.github.md`（英文优先·GitHub 版）、`CHANGELOG.md`。
+  - 消除孤立文档、确保引用无断链；版本号三处一致（SKILL.md / _meta.json / CHANGELOG.md）。
 - **2.1.0**（本次改进，响应 TRACE 测评）
   - 新增 `reset --id N --force`：修复"被 condition 跳过的任务无法重新执行"（R 项 4.5 核心短板）。
   - `ready_subtasks` 不再把 `running` 态任务重复派发，修掉 `attempts` 无限膨胀隐患。
